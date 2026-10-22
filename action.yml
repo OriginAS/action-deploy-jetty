@@ -1,0 +1,161 @@
+name: 'Deploy Jetty webapp'
+description: 'Deploys a .war to a Jetty instance on a AWS EC2 server using SSH'
+author: 'gskjold'
+inputs:
+  aws-access-key-id:
+    description: 'AWS access key that enables this action to update a security group to allow access from this action'
+    required: true
+  aws-secret-access-key:
+    description: 'AWS access key secret'
+    required: true
+  aws-security-group-id:
+    description: 'The ID of the security group we should add access from this action to'
+    required: true
+  aws-region:
+    description: 'AWS region the security group lives in'
+    required: false
+    default: 'eu-north-1'
+  application-name:
+    description: 'The context the webapp is deployed as, i.e. the .war is installed as <application-name>.war'
+    required: true
+  application-file:
+    description: 'The .war file to deploy. A glob is fine as long as it matches exactly one file'
+    required: true
+  jetty-instance:
+    description: 'The Jetty instance to deploy to (/var/jetty/<instance>). Created from the template if it does not exist'
+    required: true
+  application-properties:
+    description: 'An application.properties file to install in /var/jetty/<instance>/resources'
+    required: false
+    default: ''
+  application-vhost:
+    description: 'The vhost.conf file for apache virtual host, installed as <application-name>.conf'
+    required: false
+    default: ''
+  server-host:
+    description: 'Host name of the server to deploy to'
+    required: true
+  server-ssh-key:
+    description: 'SSH private key that can access the server'
+    required: true
+  server-user:
+    description: 'User to connect to the server as'
+    required: false
+    default: 'actions'
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      id: file
+      shell: bash
+      env:
+        APPLICATION_FILE: ${{ inputs.application-file }}
+        APPLICATION_PROPERTIES: ${{ inputs.application-properties }}
+        APPLICATION_VHOST: ${{ inputs.application-vhost }}
+      run: |
+        shopt -s nullglob
+        matches=( $APPLICATION_FILE )
+        if [ ${#matches[@]} -ne 1 ]; then
+          echo "::error::application-file '$APPLICATION_FILE' must match exactly one file, matched ${#matches[@]}"
+          exit 1
+        fi
+        if [[ ${matches[0]} != *.war ]]; then
+          echo "::error::application-file '${matches[0]}' is not a .war"
+          exit 1
+        fi
+        for f in "$APPLICATION_PROPERTIES" "$APPLICATION_VHOST"; do
+          if [ -n "$f" ] && [ ! -f "$f" ]; then
+            echo "::error::'$f' does not exist"
+            exit 1
+          fi
+        done
+        echo "war=${matches[0]}" >> $GITHUB_OUTPUT
+
+    - name: Get runner ip address
+      id: ip
+      shell: bash
+      run: echo "ipv4=$(curl -4 -s https://checkip.amazonaws.com)" >> $GITHUB_OUTPUT
+
+    - uses: aws-actions/configure-aws-credentials@v6
+      with:
+        aws-access-key-id: ${{ inputs.aws-access-key-id }}
+        aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Whitelist runner IP address
+      shell: bash
+      env:
+        AWS_SG: ${{ inputs.aws-security-group-id }}
+        RUNNER_IP: ${{ steps.ip.outputs.ipv4 }}
+      run: |
+        aws ec2 authorize-security-group-ingress \
+          --group-id "$AWS_SG" --protocol tcp --port 22 --cidr "$RUNNER_IP/32"
+
+    # Uses ~/deploy-jetty and ~/deploy-file, which are on every server the self-hosted
+    # runner deployed to, so no new server scripts need to be rolled out for this action.
+    - name: Deploy to server
+      shell: bash
+      env:
+        SSH_KEY: ${{ inputs.server-ssh-key }}
+        SERVER_USER: ${{ inputs.server-user }}
+        SERVER_HOST: ${{ inputs.server-host }}
+        APPLICATION_NAME: ${{ inputs.application-name }}
+        APPLICATION_WAR: ${{ steps.file.outputs.war }}
+        APPLICATION_PROPERTIES: ${{ inputs.application-properties }}
+        APPLICATION_VHOST: ${{ inputs.application-vhost }}
+        JETTY_INSTANCE: ${{ inputs.jetty-instance }}
+      run: |
+        set -euo pipefail
+
+        printf '%s\n' "$SSH_KEY" > "$RUNNER_TEMP/jetty_deploy_key"
+        chmod 600 "$RUNNER_TEMP/jetty_deploy_key"
+        TARGET="$SERVER_USER@$SERVER_HOST"
+
+        ssh_run() {
+          ssh -o StrictHostKeyChecking=no -i "$RUNNER_TEMP/jetty_deploy_key" "$TARGET" "$@"
+        }
+        upload() {
+          scp -o StrictHostKeyChecking=no -i "$RUNNER_TEMP/jetty_deploy_key" "$1" "$TARGET:$2"
+        }
+        # the deploy scripts only log to /opt/actions/deploy.log, so show it when they fail
+        show_log() {
+          echo "::error::$1 failed, tail of /opt/actions/deploy.log:"
+          ssh_run "tail -n 30 /opt/actions/deploy.log" || true
+          exit 1
+        }
+
+        ssh_run "mkdir -p work"
+
+        # Config first, so the new .war starts with it
+        if [ -n "$APPLICATION_PROPERTIES" ]; then
+          echo "Installing application.properties in /var/jetty/$JETTY_INSTANCE/resources"
+          upload "$APPLICATION_PROPERTIES" work/application.properties
+          ssh_run "~/deploy-file work/application.properties /var/jetty/$JETTY_INSTANCE/resources" || show_log "deploy-file"
+        fi
+
+        echo "Deploying $(basename "$APPLICATION_WAR") as $APPLICATION_NAME.war to Jetty instance $JETTY_INSTANCE"
+        upload "$APPLICATION_WAR" "work/$APPLICATION_NAME.war"
+        # deploy-jetty waits for the webapp to reach STARTED and puts the previous .war back if it does not
+        ssh_run "~/deploy-jetty work/$APPLICATION_NAME.war $JETTY_INSTANCE" || show_log "deploy-jetty"
+
+        if [ -n "$APPLICATION_VHOST" ]; then
+          echo "Installing vhost as /etc/httpd/vhosts.d/$APPLICATION_NAME.conf"
+          upload "$APPLICATION_VHOST" "work/$APPLICATION_NAME.conf"
+          ssh_run "~/deploy-file work/$APPLICATION_NAME.conf /etc/httpd/vhosts.d" || show_log "vhost install"
+          ssh_run "sudo service httpd reload" || echo "::warning::vhost installed, but httpd reload failed"
+        fi
+
+    - name: Remove deploy key
+      if: always()
+      shell: bash
+      run: rm -f "$RUNNER_TEMP/jetty_deploy_key"
+
+    - name: Revoke runner IP address
+      if: always() && steps.ip.outputs.ipv4 != ''
+      shell: bash
+      env:
+        AWS_SG: ${{ inputs.aws-security-group-id }}
+        RUNNER_IP: ${{ steps.ip.outputs.ipv4 }}
+      run: |
+        aws ec2 revoke-security-group-ingress \
+          --group-id "$AWS_SG" --protocol tcp --port 22 --cidr "$RUNNER_IP/32"
